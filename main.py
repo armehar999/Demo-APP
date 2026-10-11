@@ -1,239 +1,387 @@
+# ===== ENGINE =====
 import ast
-import html
 import math
-import operator
+import re
+
+OWNER = "Abdul Rahman"
+
+
+class CalcError(Exception):
+    """User ko dikhane wala friendly error."""
+
+
+FUNC_NAMES = [
+    "asin", "acos", "atan", "sinh", "cosh", "tanh", "sin", "cos", "tan",
+    "log", "ln", "sqrt", "cbrt", "abs", "exp", "fact",
+]
+FUNC_RE = "|".join(sorted(FUNC_NAMES, key=len, reverse=True))
+NUM = r"(?:\d+\.?\d*|\.\d+)"
+
+
+def normalize(text: str) -> str:
+    """Display wali expression ko Python-safe expression bana deta hai."""
+    s = text.strip().lower()
+    s = (s.replace("×", "*").replace("÷", "/").replace("−", "-").replace("–", "-")
+          .replace("π", "pi").replace("√", "sqrt").replace("^", "**").replace("%", "/100"))
+    s = s.replace(" ", "")
+    # 1e+20 jaisi scientific notation (result se aati hai)
+    s = re.sub(rf"(?<![\w.])({NUM})e([+-]\d+)", r"\1*10**(\2)", s)
+    # factorial: 5!
+    s = re.sub(r"(\d+)!", r"fact(\1)", s)
+    # implicit multiplication: 2pi, 3(4), )(, 2sin30, (2)3
+    s = re.sub(r"(\d|\))(?=[a-z(])", r"\1*", s)
+    s = re.sub(r"\)(?=\d|\.\d)", ")*", s)
+    s = re.sub(r"\b(pi|e)\b(?=[\d.(a-z])", r"\1*", s)
+    # bracket ke baghair function: sin30 -> sin(30), sqrt16 -> sqrt(16)
+    s = re.sub(rf"\b({FUNC_RE})(-?{NUM}|pi|e)(?![\w.(])", r"\1(\2)", s)
+    # adhoore brackets khud band kar do
+    opens = s.count("(") - s.count(")")
+    if opens > 0:
+        s += ")" * opens
+    return s
+
+
+def _clean(v: float) -> float:
+    return 0.0 if abs(v) < 1e-12 else v
+
+
+def make_funcs(degrees: bool):
+    to_rad = math.radians if degrees else (lambda x: x)
+    from_rad = math.degrees if degrees else (lambda x: x)
+
+    def tan(x):
+        if abs(math.cos(to_rad(x))) < 1e-12:
+            raise CalcError("tan is angle par define nahi hai")
+        return _clean(math.tan(to_rad(x)))
+
+    def fact(x):
+        if x != int(x) or x < 0:
+            raise CalcError("Factorial sirf 0 ya positive poore number ka hota hai")
+        if x > 170:
+            raise CalcError("Number bohat bara hai")
+        return math.factorial(int(x))
+
+    def log(x):
+        if x <= 0:
+            raise CalcError("log sirf positive number ka hota hai")
+        return math.log10(x)
+
+    def ln(x):
+        if x <= 0:
+            raise CalcError("ln sirf positive number ka hota hai")
+        return math.log(x)
+
+    def sqrt(x):
+        if x < 0:
+            raise CalcError("Negative number ka square root nahi hota")
+        return math.sqrt(x)
+
+    def cbrt(x):
+        return math.copysign(abs(x) ** (1 / 3), x)
+
+    return {
+        "sin": lambda x: _clean(math.sin(to_rad(x))),
+        "cos": lambda x: _clean(math.cos(to_rad(x))),
+        "tan": tan,
+        "asin": lambda x: from_rad(math.asin(x)),
+        "acos": lambda x: from_rad(math.acos(x)),
+        "atan": lambda x: from_rad(math.atan(x)),
+        "sinh": math.sinh, "cosh": math.cosh, "tanh": math.tanh,
+        "log": log, "ln": ln, "sqrt": sqrt, "cbrt": cbrt,
+        "abs": abs, "exp": math.exp, "fact": fact,
+    }
+
+
+BIN_OPS = {
+    ast.Add: lambda a, b: a + b,
+    ast.Sub: lambda a, b: a - b,
+    ast.Mult: lambda a, b: a * b,
+    ast.Div: lambda a, b: a / b,
+    ast.Mod: lambda a, b: a % b,
+    ast.FloorDiv: lambda a, b: a // b,
+}
+CONSTS = {"pi": math.pi, "e": math.e}
+
+
+def evaluate(expr: str, degrees: bool = True):
+    s = normalize(expr)
+    if not s:
+        raise CalcError("Pehle koi expression likhein")
+    try:
+        tree = ast.parse(s, mode="eval")
+    except SyntaxError:
+        raise CalcError("Expression adhoora ya ghalat hai")
+    funcs = make_funcs(degrees)
+
+    def ev(node):
+        if isinstance(node, ast.Expression):
+            return ev(node.body)
+        if isinstance(node, ast.Constant) and type(node.value) in (int, float):
+            return node.value
+        if isinstance(node, ast.Name) and node.id in CONSTS:
+            return CONSTS[node.id]
+        if isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.UAdd, ast.USub)):
+            v = ev(node.operand)
+            return v if isinstance(node.op, ast.UAdd) else -v
+        if isinstance(node, ast.BinOp):
+            a, b = ev(node.left), ev(node.right)
+            if isinstance(node.op, ast.Pow):
+                if a == 0 and b < 0:
+                    raise CalcError("Zero se divide nahi ho sakta")
+                if abs(b) > 100000:
+                    raise CalcError("Number bohat bara hai")
+                r = a ** b
+                if isinstance(r, complex):
+                    raise CalcError("Negative number ka fractional power nahi hota")
+                return r
+            if type(node.op) in BIN_OPS:
+                return BIN_OPS[type(node.op)](a, b)
+        if (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+                and node.func.id in funcs and len(node.args) == 1 and not node.keywords):
+            return funcs[node.func.id](ev(node.args[0]))
+        raise CalcError("Expression ghalat hai")
+
+    try:
+        val = ev(tree)
+        if isinstance(val, int) and abs(val) >= 10 ** 15:
+            val = float(val)
+    except ZeroDivisionError:
+        raise CalcError("Zero se divide nahi ho sakta")
+    except OverflowError:
+        raise CalcError("Number bohat bara hai")
+    except ValueError:
+        raise CalcError("Is value par function define nahi hai")
+    if isinstance(val, float) and not math.isfinite(val):
+        raise CalcError("Number bohat bara hai")
+    return val
+
+
+def fmt(v) -> str:
+    if isinstance(v, int) and abs(v) < 10 ** 15:
+        return str(v)
+    v = float(v)
+    if v == int(v) and abs(v) < 1e15:
+        return str(int(v))
+    return f"{v:.12g}"
+
+
+NUM_END = re.compile(r"(\d+\.?\d*|\.\d+)$")
+SCI_END = re.compile(r"e[+-]\d+$")
+
+
+def apply_key(expr: str, fresh: bool, token: str, kind: str):
+    """On-screen button dabane par nayi expression (real calculator ki tarah)."""
+    if kind == "ctrl":
+        return ("" if token == "CLR" else expr[:-1]), False
+    if kind == "fn" and expr and not SCI_END.search(expr):
+        # pehle number likha ho to function usi par lag jaye: 30 -> sin30
+        if fresh and re.fullmatch(rf"-?{NUM}", expr):
+            return token + expr, False
+        m = NUM_END.search(expr)
+        if m and not fresh and not (m.start() > 0 and expr[m.start() - 1].isalpha()):
+            return expr[:m.start()] + token + m.group(0), False
+    if fresh and kind in ("num", "fn", "const", "open"):
+        expr = ""  # naya hisaab shuru
+    return expr + token, False
+
+
+def pretty(text: str) -> str:
+    """Sirf dikhane ke liye: sin30 -> sin(30)."""
+    return re.sub(rf"(?<![A-Za-z])({FUNC_RE}|√)(-?{NUM}|pi|π|e)(?![\w.(])", r"\1(\2)", text)
+
+
+# ===== UI =====
+import json
+from html import escape
 
 import streamlit as st
+import streamlit.components.v1 as components
+
+st.set_page_config(page_title=f"Scientific Calculator | {OWNER}", page_icon="🧮", layout="centered")
+
+CSS = """
+<style>
+.stApp{background:linear-gradient(135deg,#0f172a 0%,#1e1b4b 55%,#312e81 100%);}
+header[data-testid="stHeader"]{background:transparent;}
+#MainMenu, footer{visibility:hidden;}
+.block-container{max-width:560px;padding-top:1.5rem;padding-bottom:2rem;}
+
+.hero{text-align:center;margin-bottom:.6rem;}
+.hero h1{color:#fff;font-size:2rem;margin:0;padding:0;}
+.hero .by{font-size:1.05rem;color:#cbd5e1;margin-top:.2rem;}
+.hero .by b{background:linear-gradient(90deg,#fbbf24,#f472b6,#818cf8);
+  -webkit-background-clip:text;background-clip:text;color:transparent;font-size:1.25rem;}
+
+/* mobile par bhi columns ek row mein rahein */
+div[data-testid="stHorizontalBlock"]{flex-wrap:nowrap !important;gap:.45rem !important;}
+div[data-testid="stColumn"], div[data-testid="column"]{min-width:0 !important;flex:1 1 0 !important;}
+
+/* display box */
+.stTextInput input{background:#0b1220 !important;color:#f8fafc !important;font-size:1.6rem !important;
+  text-align:right;border-radius:14px !important;height:3.4rem;border:2px solid #6366f1 !important;}
+.stTextInput input:focus{border-color:#f472b6 !important;box-shadow:0 0 0 2px rgba(244,114,182,.35) !important;}
+[data-testid="stForm"]{border:none !important;padding:0 !important;}
+[data-testid="InputInstructions"]{display:none;}
+
+.stRadio label, .stRadio p{color:#e2e8f0 !important;}
+
+.res{background:rgba(15,23,42,.75);border:1px solid #4338ca;border-radius:14px;padding:.7rem 1rem;
+  margin:.2rem 0 .7rem 0;text-align:right;color:#cbd5e1;}
+.res b{display:block;font-size:1.9rem;color:#34d399;word-break:break-all;}
+.err{background:rgba(127,29,29,.55);border:1px solid #ef4444;color:#fecaca;border-radius:14px;
+  padding:.7rem 1rem;margin:.2rem 0 .7rem 0;}
+
+/* buttons */
+.stButton>button, [data-testid="stFormSubmitButton"]>button{
+  height:3.2rem;border-radius:14px;border:none;font-weight:700;font-size:1.1rem;color:#fff;
+  box-shadow:0 3px 8px rgba(0,0,0,.35);transition:transform .08s, filter .15s;}
+.stButton>button *, [data-testid="stFormSubmitButton"]>button *{color:#fff !important;}
+.stButton>button:hover, [data-testid="stFormSubmitButton"]>button:hover{filter:brightness(1.18);}
+.stButton>button:active, [data-testid="stFormSubmitButton"]>button:active{transform:scale(.95);}
+.stButton>button{background:#334155;}
+[class*="st-key-num_"] button{background:#334155;}
+[class*="st-key-open_"] button, [class*="st-key-close_"] button{background:linear-gradient(135deg,#14b8a6,#0d9488);}
+[class*="st-key-fn_"] button{background:linear-gradient(135deg,#7c3aed,#6366f1);}
+[class*="st-key-const_"] button{background:linear-gradient(135deg,#0ea5e9,#06b6d4);}
+[class*="st-key-op_"] button{background:linear-gradient(135deg,#f59e0b,#f97316);}
+[class*="st-key-ctrl_"] button{background:linear-gradient(135deg,#ef4444,#be123c);}
+[data-testid="stFormSubmitButton"]>button{background:linear-gradient(135deg,#10b981,#059669);}
+
+.foot{text-align:center;color:#94a3b8;margin-top:1.2rem;font-size:.9rem;}
+.foot b{color:#e2e8f0;}
+</style>
+"""
+st.markdown(CSS, unsafe_allow_html=True)
+
+# ---- state ----
+for _k, _v in {"expr": "", "error": "", "fresh": False, "last_expr": "", "last_result": "", "history": []}.items():
+    st.session_state.setdefault(_k, _v)
 
 
-def _trig_functions(angle_mode):
-	angle_in = math.radians if angle_mode == "Degrees" else float
-	angle_out = math.degrees if angle_mode == "Degrees" else float
-	return {
-		"sin": lambda value: math.sin(angle_in(value)),
-		"cos": lambda value: math.cos(angle_in(value)),
-		"tan": lambda value: math.tan(angle_in(value)),
-		"asin": lambda value: angle_out(math.asin(value)),
-		"acos": lambda value: angle_out(math.acos(value)),
-		"atan": lambda value: angle_out(math.atan(value)),
-		"atan2": lambda y, x: angle_out(math.atan2(y, x)),
-	}
+def calculate():
+    expr = st.session_state.expr
+    try:
+        out = fmt(evaluate(expr, st.session_state.angle_mode == "Degree"))
+    except CalcError as e:
+        st.session_state.error = str(e)
+        return
+    st.session_state.error = ""
+    st.session_state.last_expr = expr.strip()
+    st.session_state.last_result = out
+    st.session_state.history.insert(0, (expr.strip(), out))
+    st.session_state.history = st.session_state.history[:10]
+    st.session_state.expr = out
+    st.session_state.fresh = True
 
 
-def evaluate(expression, angle_mode, answer=0):
-	functions = {
-		**_trig_functions(angle_mode),
-		"sinh": math.sinh,
-		"cosh": math.cosh,
-		"tanh": math.tanh,
-		"asinh": math.asinh,
-		"acosh": math.acosh,
-		"atanh": math.atanh,
-		"sqrt": math.sqrt,
-		"cbrt": math.cbrt,
-		"exp": math.exp,
-		"expm1": math.expm1,
-		"ln": math.log,
-		"log": math.log,
-		"log10": math.log10,
-		"log2": math.log2,
-		"log1p": math.log1p,
-		"abs": abs,
-		"fabs": math.fabs,
-		"round": round,
-		"ceil": math.ceil,
-		"floor": math.floor,
-		"trunc": math.trunc,
-		"factorial": math.factorial,
-		"comb": math.comb,
-		"perm": math.perm,
-		"gcd": math.gcd,
-		"lcm": math.lcm,
-		"min": min,
-		"max": max,
-		"sum": sum,
-		"prod": math.prod,
-		"hypot": math.hypot,
-		"fmod": math.fmod,
-		"remainder": math.remainder,
-		"copysign": math.copysign,
-		"degrees": math.degrees,
-		"radians": math.radians,
-		"pow": pow,
-	}
-	constants = {"pi": math.pi, "e": math.e, "tau": math.tau, "ans": answer}
-	binary_operators = {
-		ast.Add: operator.add,
-		ast.Sub: operator.sub,
-		ast.Mult: operator.mul,
-		ast.Div: operator.truediv,
-		ast.FloorDiv: operator.floordiv,
-		ast.Mod: operator.mod,
-		ast.Pow: operator.pow,
-		ast.BitXor: operator.pow,
-	}
-	unary_operators = {ast.UAdd: operator.pos, ast.USub: operator.neg}
-
-	if not expression.strip() or len(expression) > 200:
-		raise ValueError("Enter an expression up to 200 characters long.")
-
-	tree = ast.parse(expression.replace("^", "**"), mode="eval")
-
-	def checked(value):
-		if isinstance(value, complex):
-			raise ValueError("Complex results are not supported.")
-		if isinstance(value, (int, float)) and abs(value) > 1e308:
-			raise ValueError("The result is outside the real number range.")
-		if isinstance(value, float) and not math.isfinite(value):
-			raise ValueError("The result is outside the real number range.")
-		return value
-
-	def calculate(node):
-		if isinstance(node, ast.Expression):
-			return calculate(node.body)
-		if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)):
-			return node.value
-		if isinstance(node, (ast.List, ast.Tuple)):
-			return [calculate(element) for element in node.elts]
-		if isinstance(node, ast.Name):
-			if node.id in constants:
-				return constants[node.id]
-			raise ValueError(f"Unknown name: {node.id}")
-		if isinstance(node, ast.BinOp) and type(node.op) in binary_operators:
-			left, right = calculate(node.left), calculate(node.right)
-			if isinstance(node.op, ast.Pow) and abs(right) > 1000:
-				raise ValueError("Exponent magnitude must be 1,000 or less.")
-			return checked(binary_operators[type(node.op)](left, right))
-		if isinstance(node, ast.UnaryOp) and type(node.op) in unary_operators:
-			return checked(unary_operators[type(node.op)](calculate(node.operand)))
-		if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
-			function = functions.get(node.func.id)
-			if function is None or node.keywords:
-				raise ValueError("That function is not available.")
-			return checked(function(*(calculate(argument) for argument in node.args)))
-		raise ValueError("Use numbers, operators, constants, and supported functions only.")
-
-	result = calculate(tree)
-	if isinstance(result, complex) or not math.isfinite(result):
-		raise ValueError("The result is outside the real number range.")
-	return result
+def press(token: str, kind: str):
+    st.session_state.expr, st.session_state.fresh = apply_key(
+        st.session_state.expr, st.session_state.fresh, token, kind)
+    st.session_state.error = ""
+    if token == "CLR":
+        st.session_state.last_expr = st.session_state.last_result = ""
 
 
-def insert_text(text):
-	st.session_state.expression += text
-
-
-def clear_expression():
-	st.session_state.expression = ""
-
-
-def delete_character():
-	st.session_state.expression = st.session_state.expression[:-1]
-
-
-def calculate_result():
-	expression = st.session_state.expression.strip()
-	try:
-		result = evaluate(
-			expression,
-			st.session_state.angle_mode,
-			st.session_state.get("answer", 0),
-		)
-		st.session_state.answer = result
-		st.session_state.result = result
-		st.session_state.history.insert(0, (expression, result))
-		st.session_state.history = st.session_state.history[:10]
-		st.session_state.error = ""
-	except (ArithmeticError, SyntaxError, TypeError, ValueError) as error:
-		st.session_state.error = str(error) or "Unable to calculate this expression."
-
-
-st.set_page_config(page_title="Scientific Calculator", page_icon="∑", layout="wide")
+# ---- header ----
 st.markdown(
-	"""
-	<style>
-	@import url('https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=Manrope:wght@400;500;600;700;800&display=swap');
-	:root { --ink: #172b2b; --muted: #637373; --paper: #f4f6f2; --line: #dce3dc; --accent: #d35232; --key: #ffffff; }
-	.stApp { background: var(--paper); color: var(--ink); font-family: 'Manrope', sans-serif; }
-	[data-testid="stHeader"] { background: transparent; }
-	.block-container { max-width: 1100px; padding-top: 2.5rem; padding-bottom: 3rem; }
-	h1 { font-family: 'Manrope', sans-serif; font-size: 2rem !important; font-weight: 800 !important; letter-spacing: 0 !important; color: var(--ink); }
-	.eyebrow { color: var(--accent); font-size: .75rem; font-weight: 800; text-transform: uppercase; letter-spacing: .12em; }
-	[data-testid="stTextInput"] input { font-family: 'DM Mono', monospace; font-size: 1.55rem; min-height: 3.8rem; background: #fff; border: 1px solid var(--line); border-radius: 6px; color: var(--ink); }
-	[data-testid="stButton"] button { width: 100%; min-height: 3.1rem; border-radius: 5px; border: 1px solid var(--line); background: var(--key); color: var(--ink); font: 600 1rem 'DM Mono', monospace; transition: border-color .15s, transform .15s, background .15s; }
-	[data-testid="stButton"] button:hover { border-color: var(--accent); background: #fff8f4; color: var(--accent); transform: translateY(-1px); }
-	[data-testid="stButton"] button[kind="primary"] { background: var(--accent); border-color: var(--accent); color: #fff; }
-	[data-testid="stButton"] button[kind="primary"]:hover { background: #b94227; color: #fff; }
-	.result { font: 500 1.55rem 'DM Mono', monospace; color: var(--ink); padding: .5rem 0 1rem; overflow-wrap: anywhere; }
-	.history-expression { font: 500 .9rem 'DM Mono', monospace; color: var(--muted); }
-	.history-result { font: 600 1.05rem 'DM Mono', monospace; color: var(--ink); margin: .2rem 0 .9rem; }
-	@media (max-width: 640px) { .block-container { padding: 1.2rem 1rem 2rem; } h1 { font-size: 1.65rem !important; } [data-testid="stButton"] button { min-height: 2.8rem; font-size: .86rem; } }
-	</style>
-	""",
-	unsafe_allow_html=True,
+    f'<div class="hero"><h1>🧮 Scientific Calculator</h1>'
+    f'<div class="by">Created by <b>{escape(OWNER)}</b></div></div>',
+    unsafe_allow_html=True,
 )
 
-for key, default in {
-	"expression": "",
-	"angle_mode": "Radians",
-	"answer": 0,
-	"result": None,
-	"error": "",
-	"history": [],
-}.items():
-	st.session_state.setdefault(key, default)
+st.radio("Angle mode", ["Degree", "Radian"], horizontal=True, key="angle_mode", label_visibility="collapsed")
 
-st.markdown('<div class="eyebrow">Precision instruments / 01</div>', unsafe_allow_html=True)
-st.title("Scientific calculator")
-calculator, history_column = st.columns([1.65, 1], gap="large")
+# ---- display + Enter key ----
+with st.form("calc_form", clear_on_submit=False):
+    c1, c2 = st.columns([5, 1])
+    with c1:
+        st.text_input("Expression", key="expr", placeholder="Number likhein, jaise sin30 + 5, phir Enter dabayen",
+                      label_visibility="collapsed")
+    with c2:
+        st.form_submit_button("=", on_click=calculate, use_container_width=True)
 
-with calculator:
-	st.radio("Angle unit", ["Radians", "Degrees"], horizontal=True, key="angle_mode")
-	st.text_input("Expression", key="expression", placeholder="Try sin(pi / 4) or log(100, 10)", label_visibility="collapsed")
-	if st.session_state.result is not None:
-		st.markdown(f'<div class="result">= {html.escape(format(st.session_state.result, ".12g"))}</div>', unsafe_allow_html=True)
-	if st.session_state.error:
-		st.error(st.session_state.error)
+if st.session_state.error:
+    st.markdown(f'<div class="err">⚠️ {escape(st.session_state.error)}</div>', unsafe_allow_html=True)
+elif st.session_state.last_result:
+    st.markdown(
+        f'<div class="res">{escape(pretty(st.session_state.last_expr))} =<b>{escape(st.session_state.last_result)}</b></div>',
+        unsafe_allow_html=True,
+    )
 
-	key_rows = [
-		[("sin(", "sin("), ("cos(", "cos("), ("tan(", "tan("), ("asin(", "asin("), ("acos(", "acos(")],
-		[("atan(", "atan("), ("sinh(", "sinh("), ("cosh(", "cosh("), ("tanh(", "tanh("), ("sqrt(", "sqrt(")],
-		[("ln(", "ln("), ("log₁₀(", "log10("), ("eˣ", "exp("), ("x²", "^2"), ("xʸ", "^")],
-		[("π", "pi"), ("e", "e"), ("Ans", "ans"), ("(", "("), (")", ")")],
-		[("7", "7"), ("8", "8"), ("9", "9"), ("÷", "/"), ("⌫", "delete")],
-		[("4", "4"), ("5", "5"), ("6", "6"), ("×", "*"), ("−", "-")],
-		[("1", "1"), ("2", "2"), ("3", "3"), ("+", "+"), ("%", "%")],
-		[("0", "0"), (".", "."), ("!", "factorial("), ("C", "clear"), ("=", "equals")],
-	]
-	for row_index, row in enumerate(key_rows):
-		columns = st.columns(5, gap="small")
-		for column, (label, value) in zip(columns, row):
-			with column:
-				if value == "delete":
-					st.button(label, key=f"key-{row_index}-{label}", on_click=delete_character)
-				elif value == "clear":
-					st.button(label, key=f"key-{row_index}-{label}", on_click=clear_expression)
-				elif value == "equals":
-					st.button(label, key=f"key-{row_index}-{label}", type="primary", on_click=calculate_result)
-				else:
-					st.button(label, key=f"key-{row_index}-{label}", on_click=insert_text, args=(value,))
+# ---- keypad ----
+KEYPAD = [
+    [("sin", "fn", "sin"), ("cos", "fn", "cos"), ("tan", "fn", "tan"), ("log", "fn", "log"), ("ln", "fn", "ln")],
+    [("sin⁻¹", "fn", "asin"), ("cos⁻¹", "fn", "acos"), ("tan⁻¹", "fn", "atan"), ("√", "fn", "√"), ("x²", "op", "^2")],
+    [("π", "const", "pi"), ("e", "const", "e"), ("(", "open", "("), (")", "close", ")"), ("n!", "op", "!")],
+    [("7", "num", "7"), ("8", "num", "8"), ("9", "num", "9"), ("÷", "op", "÷"), ("DEL", "ctrl", "DEL")],
+    [("4", "num", "4"), ("5", "num", "5"), ("6", "num", "6"), ("×", "op", "×"), ("CLR", "ctrl", "CLR")],
+    [("1", "num", "1"), ("2", "num", "2"), ("3", "num", "3"), ("−", "op", "−"), ("+", "op", "+")],
+    [("0", "num", "0"), (".", "num", "."), ("^", "op", "^"), ("%", "op", "%"), ("abs", "fn", "abs")],
+]
 
-with history_column:
-	st.subheader("Recent calculations")
-	if st.session_state.history:
-		for expression, result in st.session_state.history:
-			st.markdown(
-				f'<div class="history-expression">{html.escape(expression)}</div>'
-				f'<div class="history-result">= {html.escape(format(result, ".12g"))}</div>',
-				unsafe_allow_html=True,
-			)
-		st.button("Clear history", on_click=lambda: st.session_state.update(history=[]))
-	else:
-		st.caption("Your last ten results will appear here.")
+for r, row in enumerate(KEYPAD):
+    cols = st.columns(5)
+    for c, (label, kind, token) in enumerate(row):
+        with cols[c]:
+            st.button(label, key=f"{kind}_{r}_{c}", on_click=press, args=(token, kind), use_container_width=True)
 
-with st.expander("Functions"):
-	st.write(
-		"**Trigonometry:** sin, cos, tan, asin, acos, atan, atan2, sinh, cosh, tanh, asinh, acosh, atanh. "
-		"**Numerical:** sqrt, cbrt, exp, ln, log, log10, log2, abs, round, ceil, floor, factorial, comb, perm, gcd, lcm, min, max, sum, prod, hypot, degrees, radians. "
-		"Constants: pi, e, tau, ans. Use ^ for powers."
-	)
+with st.expander("🕘 History"):
+    if st.session_state.history:
+        for e, res in st.session_state.history:
+            st.write(f"`{pretty(e)}` = **{res}**")
+    else:
+        st.caption("Abhi koi hisaab nahi hua.")
+
+st.markdown(f'<div class="foot">© 2026 <b>{escape(OWNER)}</b> • Made with ❤️ in Streamlit</div>', unsafe_allow_html=True)
+
+# ---- auto-focus: page khulte hi (aur har click ke baad) typing ke liye tayyar ----
+st.session_state.run_id = st.session_state.get("run_id", 0) + 1
+components.html(
+    """<script>
+// run #%d
+(function () {
+  var P = window.parent, doc = P.document;
+  var fresh = %s;
+  var touch = P.matchMedia && P.matchMedia('(pointer:coarse)').matches;
+  function box() { return doc.querySelector('input[aria-label="Expression"]'); }
+  function toEnd(el) { var n = el.value.length; try { el.setSelectionRange(n, n); } catch (e) {} }
+  function setVal(el, v) {
+    var setter = Object.getOwnPropertyDescriptor(P.HTMLInputElement.prototype, 'value').set;
+    setter.call(el, v);
+    el.dispatchEvent(new P.Event('input', { bubbles: true }));
+  }
+  function focusBox() { var el = box(); if (el) { el.focus(); toEnd(el); } }
+  if (!touch) { setTimeout(focusBox, 100); setTimeout(focusBox, 500); }
+
+  // result ke baad pehla number likhein to naya hisaab, operator likhein to aage chale
+  var el = box();
+  if (el) {
+    if (el.__fh) { el.removeEventListener('keydown', el.__fh); el.__fh = null; }
+    if (fresh) {
+      el.__fh = function h(ev) {
+        if (ev.ctrlKey || ev.metaKey || ev.altKey) return;
+        if (ev.key.length === 1) {
+          el.removeEventListener('keydown', h); el.__fh = null;
+          if (/[0-9.a-zA-Z(]/.test(ev.key)) { setVal(el, ''); }
+        } else if (ev.key === 'Backspace') { el.removeEventListener('keydown', h); el.__fh = null; }
+      };
+      el.addEventListener('keydown', el.__fh);
+    }
+  }
+
+  // page par kahin bhi key dabayen to wo calculator ke box mein chali jaye
+  if (!P.__calcKeys) {
+    P.__calcKeys = true;
+    doc.addEventListener('keydown', function (ev) {
+      if (ev.ctrlKey || ev.metaKey || ev.altKey) return;
+      var t = ev.target;
+      if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA')) return;
+      if (ev.key.length === 1 || ev.key === 'Backspace' || ev.key === 'Enter') {
+        var b = box(); if (b) { b.focus(); toEnd(b); }
+      }
+    }, true);
+  }
+})();
+</script>""" % (st.session_state.run_id, json.dumps(bool(st.session_state.fresh))),
+    height=0,
+)
